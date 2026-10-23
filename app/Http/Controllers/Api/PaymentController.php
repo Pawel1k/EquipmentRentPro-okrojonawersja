@@ -1,0 +1,188 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Payment;
+use App\Models\PaymentMethod;
+use App\Models\Reservation;
+use App\Services\PaymentFailedException;
+use App\Services\StripeService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+
+class PaymentController extends Controller
+{
+    private const MAX_SAVED_PAYMENT_METHODS = 3;
+
+    public function __construct(protected StripeService $stripeService) {}
+
+    public function createSetupIntent(Request $request)
+    {
+        $setupIntent = $this->stripeService->createSetupIntent($request->user());
+
+        return response()->json(['client_secret' => $setupIntent->client_secret]);
+    }
+
+    public function storePaymentMethod(Request $request)
+    {
+        $data = $request->validate([
+            'payment_method_id' => ['required', 'string'],
+            'save' => ['sometimes', 'boolean'],
+        ]);
+
+        $save = $data['save'] ?? true;
+
+        if ($save) {
+            $savedCount = $request->user()->paymentMethods()
+                ->where('is_active', true)
+                ->where('is_saved', true)
+                ->count();
+
+            if ($savedCount >= self::MAX_SAVED_PAYMENT_METHODS) {
+                return response()->json([
+                    'message' => 'Osiągnięto limit '.self::MAX_SAVED_PAYMENT_METHODS.' zapisanych metod płatności. Usuń jedną z istniejących kart, aby dodać nową.',
+                    'error_code' => 'payment_methods_limit_reached',
+                ], 409);
+            }
+        }
+
+        $paymentMethod = $this->stripeService->savePaymentMethod(
+            $request->user(),
+            $data['payment_method_id'],
+            $save,
+        );
+
+        return response()->json($paymentMethod, 201);
+    }
+
+    public function listPaymentMethods(Request $request)
+    {
+        return response()->json(
+            $request->user()->paymentMethods()
+                ->where('is_active', true)
+                ->where('is_saved', true)
+                ->latest('id')
+                ->get()
+        );
+    }
+
+    public function destroyPaymentMethod(Request $request, PaymentMethod $paymentMethod)
+    {
+        $this->stripeService->deactivatePaymentMethod($request->user(), $paymentMethod);
+
+        return response()->json(null, 204);
+    }
+
+    public function charge(Request $request)
+    {
+        $data = $request->validate([
+            'reservation_id' => ['required', 'integer'],
+            'amount' => ['nullable', 'integer', 'min:50'],
+            'currency' => ['required', 'string', 'size:3'],
+            'description' => ['required', 'string', 'max:255'],
+            'payment_method_id' => ['required', 'integer', 'exists:payment_methods,id'],
+            'buyer_nip' => ['nullable', 'string', 'max:20'],
+            'idempotency_key' => ['nullable', 'string', 'max:255'],
+        ]);
+
+        $user = $request->user();
+
+        $reservation = Reservation::where('id', $data['reservation_id'])
+            ->where('userId', $user->id)
+            ->firstOrFail();
+
+        abort_if($reservation->statusOfReservation !== 'awaiting_payment', 409, 'Ta rezerwacja nie oczekuje na płatność.');
+
+        $amount = (int) round($reservation->totalPrice * 100);
+
+        if (isset($data['amount']) && $data['amount'] !== $amount) {
+            Log::warning('Rozbieżność kwoty przy płatności za rezerwację', [
+                'user_id' => $user->id,
+                'reservation_id' => $reservation->id,
+                'client_amount' => $data['amount'],
+                'authoritative_amount' => $amount,
+            ]);
+        }
+
+        $paymentMethod = PaymentMethod::where('id', $data['payment_method_id'])
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->firstOrFail();
+
+        $payment = $this->stripeService->charge(
+            user: $user,
+            amount: $amount,
+            currency: strtolower($data['currency']),
+            description: $data['description'],
+            paymentMethod: $paymentMethod,
+            reservationId: $reservation->id,
+            idempotencyKey: $data['idempotency_key'] ?? (string) Str::uuid(),
+            offSession: false,
+            buyerNip: $data['buyer_nip'] ?? null,
+        );
+
+        return response()->json(
+            $payment,
+            $payment->status === Payment::STATUS_SUCCEEDED ? 201 : 402
+        );
+    }
+
+    public function confirmThreeDsStub(Request $request, Payment $payment)
+    {
+        abort_unless($payment->userId === $request->user()->id, 403);
+
+        $data = $request->validate([
+            'approve' => ['required', 'boolean'],
+        ]);
+
+        $payment = $this->stripeService->confirmThreeDsStub($payment, $data['approve']);
+
+        return response()->json(
+            $payment,
+            $payment->status === Payment::STATUS_SUCCEEDED ? 200 : 402
+        );
+    }
+
+    public function listPenalties(Request $request)
+    {
+        return response()->json([
+            'data' => $this->stripeService->listOpenPenaltyInvoices($request->user()),
+        ]);
+    }
+
+    public function listPayments(Request $request)
+    {
+        $query = $request->user()->payments()->orderByDesc('id');
+
+        if ($request->filled('status')) {
+            $query->where('status', $request->string('status'));
+        }
+
+        if ($request->filled('reservation_id')) {
+            $query->where('reservationID', $request->integer('reservation_id'));
+        }
+
+        $perPage = min((int) $request->input('per_page', 20), 100);
+
+        return response()->json($query->paginate($perPage));
+    }
+
+    public function invoice(Request $request, Payment $payment)
+    {
+        abort_unless($payment->userId === $request->user()->id, 403);
+
+        $invoice = $this->stripeService->getInvoiceDetails($payment);
+
+        if (! $invoice) {
+            return response()->json(['message' => 'Faktura niedostępna dla tej płatności.'], 404);
+        }
+
+        return response()->json([
+            'hosted_invoice_url' => $invoice->hosted_invoice_url,
+            'invoice_pdf' => $invoice->invoice_pdf,
+            'status' => $invoice->status,
+        ]);
+    }
+}
